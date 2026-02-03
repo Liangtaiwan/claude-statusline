@@ -125,7 +125,7 @@ fi
 
 # Add session cost to reset_info if available
 if [ -n "$session_cost" ] && [ "$session_cost" != "null" ] && [ "$session_cost" != "empty" ] && [ -n "$reset_info" ]; then
-  reset_info="${reset_info} ${GRAY}\$${session_cost}${NC}"
+  reset_info=" ${GRAY}\$${session_cost}${NC}${reset_info}"
 fi
 
 # Build context bar display
