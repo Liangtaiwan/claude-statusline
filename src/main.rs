@@ -65,6 +65,7 @@ struct AgentEntry {
 struct SkillEntry {
     name: String,
     status: Status,
+    progress: Option<String>, // e.g., "3/5 questions" from session-env
 }
 
 #[derive(Debug, Default)]
@@ -335,6 +336,7 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                                     SkillEntry {
                                         name: skill_name.to_string(),
                                         status: Status::Running,
+                                        progress: None,
                                     },
                                 );
                             }
@@ -417,6 +419,85 @@ fn parse_transcript(path: &Path) -> TranscriptState {
 }
 
 // ============================================================================
+// Session-Env Skill Status
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct SessionSkillStatus {
+    status: Option<String>,
+    progress: Option<String>,
+}
+
+/// Read skill status from session-env directory.
+/// Skills can write their own progress to ~/.claude/session-env/{session_id}/skill-status.json
+fn read_session_skills(session_id: &str) -> HashMap<String, SessionSkillStatus> {
+    if session_id.is_empty() {
+        return HashMap::new();
+    }
+
+    let home = match env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return HashMap::new(),
+    };
+
+    let path = format!("{}/.claude/session-env/{}/skill-status.json", home, session_id);
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return HashMap::new(),
+    };
+
+    let reader = BufReader::new(file);
+    match serde_json::from_reader(reader) {
+        Ok(skills) => skills,
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Merge session-env skill status into transcript-parsed skills.
+/// Session-env status overrides transcript status for running skills.
+fn merge_session_skills(skills: &mut Vec<SkillEntry>, session_skills: &HashMap<String, SessionSkillStatus>) {
+    for skill in skills.iter_mut() {
+        if let Some(session_status) = session_skills.get(&skill.name) {
+            // Override status if provided
+            if let Some(status_str) = &session_status.status {
+                skill.status = match status_str.as_str() {
+                    "running" => Status::Running,
+                    "completed" => Status::Completed,
+                    "error" => Status::Error,
+                    _ => skill.status.clone(),
+                };
+            }
+            // Add progress if provided
+            if session_status.progress.is_some() {
+                skill.progress = session_status.progress.clone();
+            }
+        }
+    }
+
+    // Also add skills that exist only in session-env (not in transcript)
+    for (name, session_status) in session_skills {
+        if !skills.iter().any(|s| &s.name == name) {
+            let status = session_status
+                .status
+                .as_ref()
+                .map(|s| match s.as_str() {
+                    "running" => Status::Running,
+                    "completed" => Status::Completed,
+                    "error" => Status::Error,
+                    _ => Status::Running,
+                })
+                .unwrap_or(Status::Running);
+
+            skills.push(SkillEntry {
+                name: name.clone(),
+                status,
+                progress: session_status.progress.clone(),
+            });
+        }
+    }
+}
+
+// ============================================================================
 // Output Formatting
 // ============================================================================
 
@@ -460,7 +541,14 @@ fn format_skills(skills: &[SkillEntry]) -> Option<String> {
                 Status::Error => (RED, ICON_ERROR),
             };
 
-            format!("{color}{icon}{NC} {}", s.name)
+            // Show progress if available: "brainstorming (3/5)"
+            let progress_str = s
+                .progress
+                .as_ref()
+                .map(|p| format!(" ({})", p))
+                .unwrap_or_default();
+
+            format!("{color}{icon}{NC} {}{}", s.name, progress_str)
         })
         .collect();
 
@@ -635,7 +723,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: claude-status <transcript_path>");
+        eprintln!("Usage: claude-status <transcript_path> [session_id]");
         std::process::exit(1);
     }
 
@@ -644,7 +732,17 @@ fn main() {
         std::process::exit(0);
     }
 
-    let state = parse_transcript(path);
+    // Optional session_id for reading skill progress from session-env
+    let session_id = args.get(2).map(|s| s.as_str()).unwrap_or("");
+
+    let mut state = parse_transcript(path);
+
+    // Merge session-env skill status (skills can report their own progress)
+    if !session_id.is_empty() {
+        let session_skills = read_session_skills(session_id);
+        merge_session_skills(&mut state.skills, &session_skills);
+    }
+
     let output = format_output(&state);
 
     if !output.is_empty() {
