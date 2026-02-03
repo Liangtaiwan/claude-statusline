@@ -87,7 +87,7 @@ if [ -f "$CACHE_FILE" ] && command -v jq >/dev/null 2>&1; then
 
                 # Only show if there's actual time remaining
                 if (( remaining > 60 )); then
-                    reset_info=" ${GRAY}⏱ ${rh}h${rm}m (${msg_count}/${MSG_LIMIT} msgs)${NC}"
+                    reset_info=" ${GRAY}⏱ ${rh}h${rm}m (${msg_count}/${MSG_LIMIT})${NC}"
                 fi
             fi
         fi
