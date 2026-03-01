@@ -5,7 +5,6 @@ use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // ANSI Colors (Catppuccin Mocha)
@@ -40,15 +39,8 @@ enum Status {
     Error,
 }
 
-#[derive(Debug, Clone)]
-struct RunningTool {
-    name: String,
-    target: Option<String>,
-}
-
 #[derive(Debug, Default)]
 struct ToolState {
-    running: Vec<RunningTool>,
     completed: HashMap<String, u32>,
 }
 
@@ -56,9 +48,7 @@ struct ToolState {
 struct AgentEntry {
     agent_type: String,
     status: Status,
-    start_time: Option<String>,
-    end_time: Option<String>,
-    start_turn: u32, // Track which turn the agent was started in
+    start_turn: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -94,71 +84,6 @@ struct TodoItem {
     active_form: Option<String>,
 }
 
-/// Truncate a file path for display, matching claude-hud's logic.
-/// If path > max_len, show `.../<filename>`.
-fn truncate_path(path: &str, max_len: usize) -> String {
-    // Normalize Windows backslashes to forward slashes
-    let normalized = path.replace('\\', "/");
-
-    if normalized.len() <= max_len {
-        return normalized;
-    }
-
-    // Extract filename
-    let filename = normalized.rsplit('/').next().unwrap_or(&normalized);
-
-    // If filename itself is too long, truncate it
-    if filename.len() >= max_len {
-        return format!("{}...", &filename[..max_len.saturating_sub(3)]);
-    }
-
-    format!(".../{}", filename)
-}
-
-fn extract_target(name: &str, input: Option<&Value>) -> Option<String> {
-    let input = input?;
-
-    match name {
-        "Read" | "Write" | "Edit" | "NotebookEdit" => {
-            let path = input
-                .get("file_path")
-                .or_else(|| input.get("notebook_path"))
-                .and_then(|v| v.as_str())?;
-            Some(truncate_path(path, 30))
-        }
-        "Glob" => input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(|s| truncate(s, 20)),
-        "Grep" => input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(|s| truncate(s, 20)),
-        "Bash" => input
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(|s| truncate(s, 25)),
-        "Task" => input
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(|s| truncate(s, 30)),
-        "WebFetch" | "WebSearch" => input
-            .get("url")
-            .or_else(|| input.get("query"))
-            .and_then(|v| v.as_str())
-            .map(|s| truncate(s, 25)),
-        _ => None,
-    }
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
-    }
-}
-
 fn update_todos(state: &mut TodoState, todos: &[TodoItem]) {
     state.total = todos.len() as u32;
     state.done = todos
@@ -177,7 +102,7 @@ fn update_todos(state: &mut TodoState, todos: &[TodoItem]) {
 
 fn parse_transcript(path: &Path) -> TranscriptState {
     let mut state = TranscriptState::default();
-    let mut tool_starts: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut tool_starts: HashMap<String, String> = HashMap::new();
     let mut agent_starts: HashMap<String, AgentEntry> = HashMap::new();
     let mut skill_starts: HashMap<String, SkillEntry> = HashMap::new();
 
@@ -209,7 +134,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
         };
 
         let line_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = value.get("timestamp").and_then(|v| v.as_str()).map(String::from);
 
         // Check if this is an agent-level message (has agentId) vs top-level conversation
         let is_top_level = value.get("agentId").is_none();
@@ -257,7 +181,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
             });
             skill_starts.clear();
             state.tools.completed.clear();
-            state.tools.running.clear();
             state.agents.clear();
             state.skills.clear();
             pending_reset = false;
@@ -313,8 +236,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                                     AgentEntry {
                                         agent_type: agent_type.to_string(),
                                         status: Status::Running,
-                                        start_time: timestamp.clone(),
-                                        end_time: None,
                                         start_turn: current_turn,
                                     },
                                 );
@@ -342,8 +263,7 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                             }
                         } else {
                             // Regular tool
-                            let target = extract_target(name, input);
-                            tool_starts.insert(id.to_string(), (name.to_string(), target));
+                            tool_starts.insert(id.to_string(), name.to_string());
                         }
                     }
                     "tool_result" => {
@@ -364,7 +284,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                             } else {
                                 Status::Completed
                             };
-                            agent.end_time = timestamp.clone();
                             continue;
                         }
 
@@ -378,8 +297,8 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                             continue;
                         }
 
-                        // Regular tool - move from running to completed
-                        if let Some((name, _)) = tool_starts.remove(tool_use_id) {
+                        // Regular tool - move to completed
+                        if let Some(name) = tool_starts.remove(tool_use_id) {
                             *state.tools.completed.entry(name).or_insert(0) += 1;
                         }
                     }
@@ -389,12 +308,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
         }
     }
 
-    // Convert remaining tool_starts to running tools
-    state.tools.running = tool_starts
-        .into_values()
-        .map(|(name, target)| RunningTool { name, target })
-        .collect();
-
     // Convert agents
     state.agents = agent_starts.into_values().collect();
 
@@ -402,10 +315,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
     state.skills = skill_starts.into_values().collect();
 
     // Limit to recent entries
-    if state.tools.running.len() > 10 {
-        let len = state.tools.running.len();
-        state.tools.running = state.tools.running.split_off(len - 10);
-    }
     if state.agents.len() > 5 {
         let len = state.agents.len();
         state.agents = state.agents.split_off(len - 5);
@@ -593,11 +502,6 @@ fn format_agents(agents: &[AgentEntry]) -> Option<String> {
         return None;
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
     let parts: Vec<String> = agents
         .iter()
         .map(|a| {
@@ -607,14 +511,7 @@ fn format_agents(agents: &[AgentEntry]) -> Option<String> {
                 Status::Error => (RED, ICON_ERROR),
             };
 
-            let elapsed = calculate_elapsed(&a.start_time, &a.end_time, now);
-            let elapsed_str = if elapsed > 0 {
-                format!(" ({}s)", elapsed)
-            } else {
-                String::new()
-            };
-
-            format!("{color}{icon}{NC} {}{}", a.agent_type, elapsed_str)
+            format!("{color}{icon}{NC} {}", a.agent_type)
         })
         .collect();
 
@@ -622,97 +519,27 @@ fn format_agents(agents: &[AgentEntry]) -> Option<String> {
 }
 
 fn format_tools(tools: &ToolState) -> Option<String> {
-    let mut parts: Vec<String> = vec![];
-
-    // Check if we have running file operations (these need more space for paths)
-    let has_file_ops = tools.running.iter().any(|t| {
-        matches!(t.name.as_str(), "Read" | "Write" | "Edit" | "NotebookEdit")
-    });
-
-    // Show fewer completed tools if we have file operations running
-    let max_completed = if has_file_ops { 2 } else { 5 };
+    if tools.completed.is_empty() {
+        return None;
+    }
 
     let mut completed: Vec<_> = tools.completed.iter().collect();
     completed.sort_by(|a, b| b.1.cmp(a.1));
 
-    for (name, count) in completed.iter().take(max_completed) {
-        let suffix = if **count > 1 {
-            format!(" ×{}", count)
-        } else {
-            String::new()
-        };
-        parts.push(format!("{GREEN}{ICON_CHECK}{NC} {}{}", name, suffix));
-    }
-
-    // Show running tools - file ops first (they have paths)
-    let mut running: Vec<_> = tools.running.iter().collect();
-    running.sort_by_key(|t| {
-        // File operations come first (lower sort key)
-        if matches!(t.name.as_str(), "Read" | "Write" | "Edit" | "NotebookEdit") {
-            0
-        } else {
-            1
-        }
-    });
-
-    for tool in running.iter().take(2) {
-        let target = tool
-            .target
-            .as_ref()
-            .map(|t| format!(" {}", t))
-            .unwrap_or_default();
-        parts.push(format!("{YELLOW}{ICON_SPINNER}{NC} {}{}", tool.name, target));
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(format!("{LAVENDER}{ICON_TOOLS}{NC} {}", parts.join(" ")))
-    }
-}
-
-fn calculate_elapsed(start: &Option<String>, end: &Option<String>, now_secs: u64) -> u64 {
-    let start_secs = start
-        .as_ref()
-        .and_then(|s| parse_timestamp(s))
-        .unwrap_or(now_secs);
-
-    let end_secs = end
-        .as_ref()
-        .and_then(|s| parse_timestamp(s))
-        .unwrap_or(now_secs);
-
-    end_secs.saturating_sub(start_secs)
-}
-
-fn parse_timestamp(ts: &str) -> Option<u64> {
-    let ts = ts.trim_end_matches('Z');
-    let parts: Vec<&str> = ts.split('T').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let date_parts: Vec<u32> = parts[0]
-        .split('-')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let time_str = parts[1].split('.').next()?;
-    let time_parts: Vec<u32> = time_str
-        .split(':')
-        .filter_map(|s| s.parse().ok())
+    let parts: Vec<String> = completed
+        .iter()
+        .take(5)
+        .map(|(name, count)| {
+            let suffix = if **count > 1 {
+                format!(" ×{}", count)
+            } else {
+                String::new()
+            };
+            format!("{GREEN}{ICON_CHECK}{NC} {}{}", name, suffix)
+        })
         .collect();
 
-    if date_parts.len() != 3 || time_parts.len() != 3 {
-        return None;
-    }
-
-    let days_since_epoch = (date_parts[0] - 1970) as u64 * 365
-        + date_parts[1] as u64 * 30
-        + date_parts[2] as u64;
-    let seconds_in_day =
-        time_parts[0] as u64 * 3600 + time_parts[1] as u64 * 60 + time_parts[2] as u64;
-
-    Some(days_since_epoch * 86400 + seconds_in_day)
+    Some(format!("{LAVENDER}{ICON_TOOLS}{NC} {}", parts.join(" ")))
 }
 
 // ============================================================================
@@ -747,18 +574,5 @@ fn main() {
 
     if !output.is_empty() {
         println!("{}", output);
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_truncate_path_long() {
-        let path = "testdir/dir1/dir2/dir3/dir4/dir5/longfilenametest.py";
-        let result = truncate_path(path, 30);
-        assert_eq!(result, ".../longfilenametest.py", "Path: {}, Result: {}", path, result);
     }
 }
