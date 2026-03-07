@@ -68,14 +68,19 @@ struct AgentEntry {
 struct SkillEntry {
     name: String,
     status: Status,
-    progress: Option<String>, // e.g., "3/5 questions" from session-env
+    progress: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskItem {
+    subject: String,
+    active_form: Option<String>,
+    status: String, // "pending", "in_progress", "completed"
 }
 
 #[derive(Debug, Default)]
-struct TodoState {
-    current: Option<String>,
-    done: u32,
-    total: u32,
+struct TaskState {
+    tasks: Vec<(String, TaskItem)>, // (id, item) in creation order
 }
 
 #[derive(Debug, Default)]
@@ -83,19 +88,12 @@ struct TranscriptState {
     tools: ToolState,
     agents: Vec<AgentEntry>,
     skills: Vec<SkillEntry>,
-    todos: TodoState,
+    tasks: TaskState,
 }
 
 // ============================================================================
 // JSONL Parsing
 // ============================================================================
-
-#[derive(Debug, Deserialize)]
-struct TodoItem {
-    status: Option<String>,
-    #[serde(rename = "activeForm")]
-    active_form: Option<String>,
-}
 
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
@@ -104,18 +102,6 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let end = s.char_indices().nth(max_len - 1).map(|(i, _)| i).unwrap_or(s.len());
         format!("{}\u{2026}", &s[..end]) // ellipsis character
     }
-}
-
-fn update_todos(state: &mut TodoState, todos: &[TodoItem]) {
-    state.total = todos.len() as u32;
-    state.done = todos
-        .iter()
-        .filter(|t| t.status.as_deref() == Some("completed"))
-        .count() as u32;
-    state.current = todos
-        .iter()
-        .find(|t| t.status.as_deref() == Some("in_progress"))
-        .and_then(|t| t.active_form.clone());
 }
 
 // ============================================================================
@@ -128,10 +114,11 @@ fn parse_transcript(path: &Path) -> TranscriptState {
     let mut agent_starts: HashMap<String, AgentEntry> = HashMap::new();
     let mut skill_starts: HashMap<String, SkillEntry> = HashMap::new();
 
-    // Agent progress tracking: agentId -> tool_count
-    let mut agent_progress: HashMap<String, u32> = HashMap::new();
-    let mut agent_id_map: HashMap<String, String> = HashMap::new(); // agentId -> task tool_use_id
-    let mut unmapped_tasks: Vec<String> = Vec::new();
+    // Agent progress tracking: agentId -> parent tool_use_id (from progress events)
+    let mut agent_id_map: HashMap<String, String> = HashMap::new();
+
+    // Task ID counter (TaskCreate assigns sequential IDs: "1", "2", ...)
+    let mut next_task_id: u32 = 1;
 
     let file = match File::open(path) {
         Ok(f) => f,
@@ -162,22 +149,7 @@ fn parse_transcript(path: &Path) -> TranscriptState {
 
         let line_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Check if this is an agent-level message (has agentId) vs top-level conversation
-        let agent_id = value.get("agentId").and_then(|v| v.as_str());
-        let is_top_level = agent_id.is_none();
-
-        // Map new agentIds to their parent Task tool_use_id (FIFO heuristic,
-        // may be overwritten by authoritative progress events below)
-        if let Some(aid) = agent_id {
-            if !agent_id_map.contains_key(aid) {
-                if let Some(task_id) = unmapped_tasks.first().cloned() {
-                    unmapped_tasks.remove(0);
-                    agent_id_map.insert(aid.to_string(), task_id);
-                }
-            }
-        }
-
-        if line_type == "user" && is_top_level {
+        if line_type == "user" {
             // Check if this is actually a tool result message (not a real user message)
             let is_tool_result = value
                 .get("message")
@@ -196,25 +168,16 @@ fn parse_transcript(path: &Path) -> TranscriptState {
             // Check if this is a skill content message (has sourceToolUseID)
             let is_skill_content = value.get("sourceToolUseID").is_some();
 
-            // Check if this is an agent notification (background task completion)
-            let is_agent_notification = value
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .map(|s| s.starts_with("<agent-notification>"))
-                .unwrap_or(false);
-
-            if !is_tool_result && !is_meta && !is_skill_content && !is_agent_notification {
+            if !is_tool_result && !is_meta && !is_skill_content {
                 pending_reset = true;
             }
         }
 
         // Reset activity when assistant starts responding (new turn)
-        if line_type == "assistant" && is_top_level && pending_reset {
+        if line_type == "assistant" && pending_reset {
             current_turn += 1;
             tool_starts.clear();
             // Keep only agents that are BOTH running AND from the current or previous turn
-            // This ensures agents don't persist indefinitely if their tool_result is missing
             agent_starts.retain(|_, agent| {
                 agent.status == Status::Running && agent.start_turn >= current_turn.saturating_sub(1)
             });
@@ -222,13 +185,13 @@ fn parse_transcript(path: &Path) -> TranscriptState {
             state.tools.completed.clear();
             state.agents.clear();
             state.skills.clear();
-            unmapped_tasks.clear();
-            agent_progress.clear();
+            state.tasks = TaskState::default();
+            next_task_id = 1;
             agent_id_map.retain(|_, task_id| agent_starts.contains_key(task_id));
             pending_reset = false;
         }
 
-        // Process agent_progress messages for agentId <-> tool_use_id mapping
+        // Process agent_progress events for agentId <-> tool_use_id mapping
         if line_type == "progress" {
             if let Some(data) = value.get("data") {
                 if data.get("type").and_then(|v| v.as_str()) == Some("agent_progress") {
@@ -239,15 +202,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                     }
                 }
             }
-        }
-
-        // Process todos from user messages
-        if let Some(todos) = value.get("todos").and_then(|v| v.as_array()) {
-            let todo_items: Vec<TodoItem> = todos
-                .iter()
-                .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                .collect();
-            update_todos(&mut state.todos, &todo_items);
         }
 
         // Process message content
@@ -265,27 +219,59 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                             continue;
                         }
 
-                        // Agent-level tool use: track count in agent progress
-                        if let Some(aid) = agent_id {
-                            *agent_progress.entry(aid.to_string()).or_insert(0) += 1;
+                        // Handle TaskCreate: add task with sequential ID
+                        if name == "TaskCreate" {
+                            if let Some(input) = input {
+                                let subject = input
+                                    .get("subject")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("task");
+                                let active_form = input
+                                    .get("activeForm")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+
+                                state.tasks.tasks.push((
+                                    next_task_id.to_string(),
+                                    TaskItem {
+                                        subject: subject.to_string(),
+                                        active_form,
+                                        status: "pending".to_string(),
+                                    },
+                                ));
+                                next_task_id += 1;
+                            }
                             continue;
                         }
 
-                        // Handle TodoWrite
-                        if name == "TodoWrite" {
+                        // Handle TaskUpdate: modify existing task status
+                        if name == "TaskUpdate" {
                             if let Some(input) = input {
-                                if let Some(todos_arr) = input.get("todos").and_then(|v| v.as_array()) {
-                                    let todo_items: Vec<TodoItem> = todos_arr
-                                        .iter()
-                                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                                        .collect();
-                                    update_todos(&mut state.todos, &todo_items);
+                                let task_id = input
+                                    .get("taskId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let status = input
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+
+                                if !task_id.is_empty() && !status.is_empty() {
+                                    if let Some((_, task)) = state.tasks.tasks.iter_mut().find(|(id, _)| id == task_id) {
+                                        task.status = status.to_string();
+                                    }
                                 }
                             }
+                            continue;
                         }
 
-                        // Handle Task/Agent (agents)
-                        if name == "Task" || name == "Agent" {
+                        // Skip other task management tools from tool display
+                        if name == "TaskOutput" || name == "TaskStop" || name == "TaskGet" || name == "TaskList" {
+                            continue;
+                        }
+
+                        // Handle Agent (subagents)
+                        if name == "Agent" {
                             if let Some(input) = input {
                                 let subagent_type = input
                                     .get("subagent_type")
@@ -312,7 +298,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                                         tool_count: 0,
                                     },
                                 );
-                                unmapped_tasks.push(id.to_string());
                             }
                         } else if name == "Skill" {
                             // Handle Skill invocations
@@ -351,11 +336,6 @@ fn parse_transcript(path: &Path) -> TranscriptState {
                             continue;
                         }
 
-                        // Agent-level tool result: skip (already counted on tool_use)
-                        if agent_id.is_some() {
-                            continue;
-                        }
-
                         // Check if it's an agent
                         if let Some(agent) = agent_starts.get_mut(tool_use_id) {
                             agent.status = if is_error {
@@ -391,15 +371,10 @@ fn parse_transcript(path: &Path) -> TranscriptState {
         }
     }
 
-    // Merge agent progress from inline messages (older Claude Code) and store agentId mapping
+    // Map agentIds from progress events to agent entries
     for (aid, task_id) in &agent_id_map {
         if let Some(agent) = agent_starts.get_mut(task_id) {
             agent.agent_id = Some(aid.clone());
-            if let Some(&count) = agent_progress.get(aid) {
-                if agent.tool_count == 0 {
-                    agent.tool_count = count;
-                }
-            }
         }
     }
 
@@ -409,7 +384,7 @@ fn parse_transcript(path: &Path) -> TranscriptState {
     // Convert skills
     state.skills = skill_starts.into_values().collect();
 
-    // Keep only the most recent entries (HashMap iteration order is arbitrary)
+    // Keep only the most recent entries
     if state.agents.len() > 5 {
         state.agents.sort_by_key(|a| std::cmp::Reverse(a.start_turn));
         state.agents.truncate(5);
@@ -574,8 +549,8 @@ fn merge_session_skills(skills: &mut Vec<SkillEntry>, session_skills: &HashMap<S
 fn format_output(state: &TranscriptState) -> String {
     let mut parts: Vec<String> = vec![];
 
-    if let Some(todo_str) = format_todos(&state.todos) {
-        parts.push(todo_str);
+    if let Some(task_str) = format_tasks(&state.tasks) {
+        parts.push(task_str);
     }
 
     if let Some(skill_str) = format_skills(&state.skills) {
@@ -625,33 +600,33 @@ fn format_skills(skills: &[SkillEntry]) -> Option<String> {
     Some(format!("{LAVENDER}{ICON_SKILLS}{NC} {}", parts.join(" ")))
 }
 
-fn format_todos(todos: &TodoState) -> Option<String> {
-    if todos.total == 0 {
+fn format_tasks(tasks: &TaskState) -> Option<String> {
+    if tasks.tasks.is_empty() {
         return None;
     }
 
-    let (color, icon) = if todos.done == todos.total {
+    let total = tasks.tasks.len() as u32;
+    let done = tasks.tasks.iter().filter(|(_, t)| t.status == "completed").count() as u32;
+    let current = tasks.tasks.iter().find(|(_, t)| t.status == "in_progress");
+
+    let (color, icon) = if done == total {
         (GREEN, ICON_CHECK)
     } else {
         (YELLOW, ICON_SPINNER)
     };
 
-    let text = if let Some(ref current) = todos.current {
-        if todos.done < todos.total {
-            format!(
-                "{LAVENDER}{ICON_TODOS}{NC} {color}{icon}{NC} {current} ({}/{})",
-                todos.done, todos.total
-            )
-        } else {
-            format!(
-                "{LAVENDER}{ICON_TODOS}{NC} {color}{icon}{NC} All done ({}/{})",
-                todos.done, todos.total
-            )
-        }
+    let text = if let Some((_, task)) = current {
+        let display = task.active_form.as_deref().unwrap_or(&task.subject);
+        format!(
+            "{LAVENDER}{ICON_TODOS}{NC} {color}{icon}{NC} {display} ({done}/{total})",
+        )
+    } else if done == total {
+        format!(
+            "{LAVENDER}{ICON_TODOS}{NC} {color}{icon}{NC} All done ({done}/{total})",
+        )
     } else {
         format!(
-            "{LAVENDER}{ICON_TODOS}{NC} {color}{icon}{NC} {}/{}",
-            todos.done, todos.total
+            "{LAVENDER}{ICON_TODOS}{NC} {color}{icon}{NC} {done}/{total}",
         )
     };
 
@@ -698,7 +673,7 @@ fn format_tools(tools: &ToolState) -> Option<String> {
         .take(5)
         .map(|(name, count)| {
             let suffix = if **count > 1 {
-                format!(" ×{}", count)
+                format!(" x{}", count)
             } else {
                 String::new()
             };
@@ -756,5 +731,3 @@ fn main() {
         println!("{}", output);
     }
 }
-
-
