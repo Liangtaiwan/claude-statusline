@@ -112,14 +112,14 @@ MSG_COUNT_CACHE="/tmp/claude-msg-count"
 MSG_CACHE_TTL=15
 msg_count=0
 
+cache_stale=1
 if [ -f "$MSG_COUNT_CACHE" ]; then
+    msg_count=$(cat "$MSG_COUNT_CACHE" 2>/dev/null)
     cache_age=$((now_sec - $(stat -f%m "$MSG_COUNT_CACHE" 2>/dev/null || stat -c%Y "$MSG_COUNT_CACHE" 2>/dev/null || echo 0)))
-    if [ "$cache_age" -lt "$MSG_CACHE_TTL" ]; then
-        msg_count=$(cat "$MSG_COUNT_CACHE" 2>/dev/null)
-    fi
+    [ "$cache_age" -lt "$MSG_CACHE_TTL" ] && cache_stale=0
 fi
 
-if [ -z "$msg_count" ] || [ "$msg_count" = "0" ] && [ "$window_start" -gt 0 ] 2>/dev/null; then
+if [ "$cache_stale" = "1" ] && [ "$window_start" -gt 0 ] 2>/dev/null; then
     # Background: count user messages with string content (real inputs, not tool_results)
     # across all sessions including subagents
     (
