@@ -23,13 +23,13 @@ NC='\033[0m' # No Color
 
 # ============================================================================
 # Usage Limit / Reset Time
-# Parses rate limit error messages to find the fixed 5h window schedule.
-# One reference epoch is enough to predict all future windows.
+# Parses rate limit error messages to find the 5h window schedule.
+# Rescans periodically since the window schedule can shift.
 # ============================================================================
 
 reset_info=""
-MSG_LIMIT=225  # Max 5x: 225, Pro: 45, Max 20x: 900
 RESET_REF_CACHE="$HOME/.claude/cache/claude-reset-ref"
+TOKEN_BUDGET_CACHE="$HOME/.claude/cache/claude-token-budget"
 now_sec=$(date +%s)
 
 # Convert "9pm"→21, "6am"→6, "12am"→0, "12pm"→12
@@ -82,18 +82,58 @@ _scan_reset_ref() {
         done
     done < <(grep -rh '"isApiErrorMessage":true' ~/.claude/projects --include="*.jsonl" 2>/dev/null)
 
-    [ "$best_epoch" -gt 0 ] && echo "$best_epoch"
+    [ "$best_epoch" -gt 0 ] && echo "$best_epoch $best_ts"
 }
 
-# Load reference reset epoch (scan transcripts if missing)
+# Compute token budget: sum output_tokens from window_start to error_timestamp
+_compute_token_budget() {
+    local err_ts="$1" reset_epoch="$2"
+    local ws=$((reset_epoch - 5*3600))
+    local co_start co_end
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        co_start=$(date -j -u -r "$ws" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
+        co_end=$(date -j -u -r "$err_ts" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
+    else
+        co_start=$(date -u -d "@$ws" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
+        co_end=$(date -u -d "@$err_ts" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
+    fi
+    [ -z "$co_start" ] || [ -z "$co_end" ] && return
+    local total=0
+    for f in $(find ~/.claude/projects -name "*.jsonl" 2>/dev/null); do
+        local n
+        n=$(grep '"type":"assistant"' "$f" 2>/dev/null | \
+            awk -v s="$co_start" -v e="$co_end" -F'"timestamp":"' '{split($2,a,"\""); if(a[1]>s && a[1]<e) print}' | \
+            grep -oE '"output_tokens":[0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+        total=$((total + n))
+    done
+    [ "$total" -gt 0 ] && echo "$total"
+}
+
+# Load reference reset epoch (rescan periodically to catch schedule shifts)
+REF_CACHE_TTL=60
 ref_epoch=0
+ref_stale=1
 if [ -f "$RESET_REF_CACHE" ]; then
     ref_epoch=$(cat "$RESET_REF_CACHE" 2>/dev/null)
+    ref_age=$((now_sec - $(stat -f%m "$RESET_REF_CACHE" 2>/dev/null || stat -c%Y "$RESET_REF_CACHE" 2>/dev/null || echo 0)))
+    [ "$ref_age" -lt "$REF_CACHE_TTL" ] && ref_stale=0
 fi
 
-if [ -z "$ref_epoch" ] || [ "$ref_epoch" -le 0 ] 2>/dev/null; then
-    # Run scan in background; result appears on next statusline render
-    ( result=$(_scan_reset_ref); [ -n "$result" ] && echo "$result" > "$RESET_REF_CACHE" ) &
+if [ "$ref_stale" = "1" ]; then
+    # Background rescan; updates cache and computes token budget if new error found
+    (
+        result=$(_scan_reset_ref)
+        [ -z "$result" ] && exit
+        new_epoch=$(echo "$result" | awk '{print $1}')
+        err_ts=$(echo "$result" | awk '{print $2}')
+        echo "$new_epoch" > "$RESET_REF_CACHE"
+        # Recompute budget if this is a new reference
+        old_epoch=$(cat "$TOKEN_BUDGET_CACHE" 2>/dev/null | awk '{print $2}')
+        if [ "$new_epoch" != "$old_epoch" ] && [ -n "$err_ts" ] && [ "$err_ts" -gt 0 ]; then
+            budget=$(_compute_token_budget "$err_ts" "$new_epoch")
+            [ -n "$budget" ] && echo "$budget $new_epoch" > "$TOKEN_BUDGET_CACHE"
+        fi
+    ) &
 fi
 
 # Derive current window reset from reference (advance by 5h intervals)
@@ -107,21 +147,26 @@ if [ -n "$ref_epoch" ] && [ "$ref_epoch" -gt 0 ] 2>/dev/null; then
     window_start=$(( reset_sec - 5*3600 ))
 fi
 
-# Message count: real user inputs from all transcripts (cached background scan)
-MSG_COUNT_CACHE="/tmp/claude-msg-count"
-MSG_CACHE_TTL=15
-msg_count=0
+# Usage percentage: output_tokens in current window vs budget from last rate limit
+USAGE_TOKENS_CACHE="/tmp/claude-usage-tokens"
+USAGE_CACHE_TTL=15
+usage_tokens=0
+token_budget=0
 
-cache_stale=1
-if [ -f "$MSG_COUNT_CACHE" ]; then
-    msg_count=$(cat "$MSG_COUNT_CACHE" 2>/dev/null)
-    cache_age=$((now_sec - $(stat -f%m "$MSG_COUNT_CACHE" 2>/dev/null || stat -c%Y "$MSG_COUNT_CACHE" 2>/dev/null || echo 0)))
-    [ "$cache_age" -lt "$MSG_CACHE_TTL" ] && cache_stale=0
+# Load token budget (from last rate-limit calibration)
+[ -f "$TOKEN_BUDGET_CACHE" ] && token_budget=$(awk '{print $1}' "$TOKEN_BUDGET_CACHE" 2>/dev/null)
+token_budget=${token_budget:-0}
+
+# Load current window output_tokens (stale-while-revalidate)
+usage_stale=1
+if [ -f "$USAGE_TOKENS_CACHE" ]; then
+    usage_tokens=$(cat "$USAGE_TOKENS_CACHE" 2>/dev/null)
+    cache_age=$((now_sec - $(stat -f%m "$USAGE_TOKENS_CACHE" 2>/dev/null || stat -c%Y "$USAGE_TOKENS_CACHE" 2>/dev/null || echo 0)))
+    [ "$cache_age" -lt "$USAGE_CACHE_TTL" ] && usage_stale=0
 fi
 
-if [ "$cache_stale" = "1" ] && [ "$window_start" -gt 0 ] 2>/dev/null; then
-    # Background: count user messages with string content (real inputs, not tool_results)
-    # across all sessions including subagents
+if [ "$usage_stale" = "1" ] && [ "$window_start" -gt 0 ] 2>/dev/null; then
+    # Background: sum output_tokens from all assistant messages in current window
     (
         if [[ "$OSTYPE" == "darwin"* ]]; then
             co=$(date -j -u -r "$window_start" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
@@ -129,16 +174,17 @@ if [ "$cache_stale" = "1" ] && [ "$window_start" -gt 0 ] 2>/dev/null; then
             co=$(date -u -d "@$window_start" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null)
         fi
         [ -z "$co" ] && exit
-        c=0
+        total=0
         for f in $(find ~/.claude/projects -name "*.jsonl" -mmin -360 2>/dev/null); do
-            n=$(grep '"type":"user"' "$f" 2>/dev/null | grep -v '"tool_result"' | \
-                awk -v cutoff="$co" -F'"timestamp":"' '{split($2,a,"\""); if(a[1] > cutoff) print}' | wc -l)
-            c=$((c + n))
+            n=$(grep '"type":"assistant"' "$f" 2>/dev/null | \
+                awk -v cutoff="$co" -F'"timestamp":"' '{split($2,a,"\""); if(a[1] > cutoff) print}' | \
+                grep -oE '"output_tokens":[0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+            total=$((total + n))
         done
-        echo "$c" > "$MSG_COUNT_CACHE"
+        echo "$total" > "$USAGE_TOKENS_CACHE"
     ) &
 fi
-msg_count=${msg_count:-0}
+usage_tokens=${usage_tokens:-0}
 
 # Format
 if [ -n "$reset_sec" ] && [ "$reset_sec" -gt 0 ] 2>/dev/null; then
@@ -146,17 +192,41 @@ if [ -n "$reset_sec" ] && [ "$reset_sec" -gt 0 ] 2>/dev/null; then
     (( remaining < 0 )) && remaining=0
     rh=$(( remaining / 3600 ))
     rm=$(( (remaining % 3600) / 60 ))
-    if (( remaining > 60 )); then
-        reset_info=" ${GRAY}⏱ ${rh}h${rm}m (${msg_count}/${MSG_LIMIT})${NC}"
-    else
-        reset_info=" ${GRAY}(${msg_count}/${MSG_LIMIT})${NC}"
+    use_info=""
+    if [ "$token_budget" -gt 0 ] && [ "$usage_tokens" -gt 0 ]; then
+        use_pct=$((usage_tokens * 100 / token_budget))
+        [ "$use_pct" -gt 100 ] && use_pct=100
+        use_info=" (${use_pct}%)"
     fi
-elif [ "$msg_count" -gt 0 ] 2>/dev/null; then
-    reset_info=" ${GRAY}(${msg_count}/${MSG_LIMIT})${NC}"
+    if (( remaining > 60 )); then
+        reset_info=" ${GRAY}⏱ ${rh}h${rm}m${use_info}${NC}"
+    else
+        reset_info=" ${GRAY}${use_info:-resetting}${NC}"
+    fi
+elif [ "$usage_tokens" -gt 0 ] && [ "$token_budget" -gt 0 ]; then
+    use_pct=$((usage_tokens * 100 / token_budget))
+    [ "$use_pct" -gt 100 ] && use_pct=100
+    reset_info=" ${GRAY}(${use_pct}%)${NC}"
 fi
 
-# Extract context percentage (available since Claude Code 2.1.6)
-context_percent=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d'.' -f1)
+# Context percentage using effective window (200K - 20K output reservation = 180K)
+# See: github.com/anthropics/claude-code/issues/18944
+ctx_window=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
+[ "$ctx_window" = "null" ] && ctx_window=200000
+ctx_effective=$((ctx_window - 20000))
+ctx_input=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')
+ctx_cache_create=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
+ctx_cache_read=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
+[ "$ctx_input" = "null" ] && ctx_input=0
+[ "$ctx_cache_create" = "null" ] && ctx_cache_create=0
+[ "$ctx_cache_read" = "null" ] && ctx_cache_read=0
+ctx_tokens=$((ctx_input + ctx_cache_create + ctx_cache_read))
+if [ "$ctx_tokens" -gt 0 ] && [ "$ctx_effective" -gt 0 ]; then
+    context_percent=$((ctx_tokens * 100 / ctx_effective))
+    [ "$context_percent" -gt 100 ] && context_percent=100
+else
+    context_percent=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d'.' -f1)
+fi
 
 # Build context progress bar (15 chars wide)
 bar_width=15
