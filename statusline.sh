@@ -1,20 +1,20 @@
 #!/bin/bash
 
 # Read JSON input from stdin
-input=$(cat)
+input=$(</dev/stdin)
 
-# Extract information from JSON
-model_name=$(echo "$input" | jq -r '.model.display_name')
-current_dir=$(echo "$input" | jq -r '.workspace.current_dir')
-transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
-session_id=$(echo "$input" | jq -r '.session_id // empty')
-
-# Extract cost, duration, and line changes from JSON
-session_cost=$(echo "$input" | jq -r '.cost.total_cost_usd // empty')
+# Extract all fields from JSON in a single jq call (pipe delimiter avoids empty-field collapse)
+IFS='|' read -r model_name current_dir transcript_path session_id session_cost context_percent \
+  <<< "$(echo "$input" | jq -r '[
+    .model.display_name,
+    .workspace.current_dir,
+    (.transcript_path // ""),
+    (.session_id // ""),
+    (.cost.total_cost_usd // ""),
+    ((.context_window.used_percentage // 0) | floor | tostring)
+  ] | join("|")')"
 
 # Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
@@ -58,8 +58,11 @@ reset_sec=""
 
 # Load from API cache (stale-while-revalidate)
 if [ -f "$USAGE_API_CACHE" ]; then
-    session_use_pct=$(jq -r 'if .five_hour.utilization then (.five_hour.utilization | floor) else empty end' "$USAGE_API_CACHE" 2>/dev/null)
-    api_reset_str=$(jq -r '.five_hour.resets_at // empty' "$USAGE_API_CACHE" 2>/dev/null)
+    IFS='|' read -r session_use_pct api_reset_str \
+      <<< "$(jq -r '[
+        (if .five_hour.utilization then (.five_hour.utilization | floor | tostring) else "" end),
+        (.five_hour.resets_at // "")
+      ] | join("|")' "$USAGE_API_CACHE" 2>/dev/null)"
     [ -n "$api_reset_str" ] && reset_sec=$(_iso_to_epoch "$api_reset_str")
 fi
 
@@ -159,17 +162,13 @@ elif [ -n "$session_use_pct" ] && [ "$session_use_pct" -gt 0 ] 2>/dev/null; then
     reset_info=" ${GRAY}(${session_use_pct}%)${NC}"
 fi
 
-# Context percentage (use Claude Code's authoritative value)
-context_percent=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d'.' -f1)
-[ "$context_percent" = "null" ] && context_percent=0
-
 # Build context progress bar (15 chars wide)
+full="███████████████"
+empty_str="░░░░░░░░░░░░░░░"
 bar_width=15
 filled=$((context_percent * bar_width / 100))
 empty=$((bar_width - filled))
-bar=""
-for ((i = 0; i < filled; i++)); do bar+="█"; done
-for ((i = 0; i < empty; i++)); do bar+="░"; done
+bar="${full:0:filled}${empty_str:0:empty}"
 
 # Format session cost
 cost_info=""
@@ -178,29 +177,24 @@ if [ -n "$session_cost" ] && [ "$session_cost" != "null" ] && [ "$session_cost" 
     cost_info=" ${GRAY}\$${session_cost}${NC}"
 fi
 
-# Get directory name (basename)
-dir_name=$(basename "$current_dir")
-
-# Change to the current directory to get git info
-cd "$current_dir" 2>/dev/null || cd /
-
-# Get git branch
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  branch=$(git branch --show-current 2>/dev/null || echo "detached")
-  git_info=" ${YELLOW}${branch}${NC}"
+# Get directory name and git branch
+dir_name="${current_dir##*/}"
+if git -C "$current_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    branch=$(git -C "$current_dir" branch --show-current 2>/dev/null || echo "detached")
+    git_info=" ${YELLOW}${branch}${NC}"
 else
-  git_info=""
+    git_info=""
 fi
 
 # Build context bar display
 context_info="${GRAY}${bar}${NC} ${context_percent}%"
 
-# Line 1: Context, cost, duration, lines, usage limit, git, dir, model
+# Line 1: Context, cost, usage limit, git, dir, model
 line1="${context_info}${cost_info}${reset_info}${git_info:+ ${GRAY}|${NC}}${git_info} ${GRAY}|${NC} ${BLUE}${dir_name}${NC} ${GRAY}|${NC} ${CYAN}${model_name}${NC}"
 
 # Line 2: Tool/agent/todo status from Rust binary
 line2=""
-if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+if [ -n "$transcript_path" ]; then
     line2=$(~/.claude/bin/claude-status "$transcript_path" "$session_id" 2>/dev/null)
 fi
 
