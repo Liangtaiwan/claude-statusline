@@ -8,27 +8,30 @@ A real-time statusline plugin for [Claude Code](https://claude.ai/claude-code) t
 
 - **Context Window**: Visual progress bar showing token usage
 - **Session Cost**: Running cost of the current session
-- **Git Status**: Current branch with file counts and line changes
+- **Rate Limits**: 5-hour and 7-day usage windows with reset countdown, read from Claude Code's native payload (color-coded as they fill)
+- **Git Status**: Current branch plus working-tree diff stats (files changed, lines +/-)
+- **Reasoning Effort**: Current session's effort level (low/medium/high/xhigh/max), shown after the model and colored by tier
 - **Tool Activity**: Real-time display of running and completed tools
-- **Agent Status**: Track spawned agents (Explore, code-reviewer, etc.) with elapsed time
+- **Agent Status**: Track spawned agents (Explore, code-reviewer, etc.) with per-agent tool counts
 - **Skill Tracking**: Show which skill Claude is currently using (brainstorming, TDD, etc.)
 - **Todo Progress**: Current task and completion status (done/total)
 
 ## Preview
 
 ```
-██████░░░░░░░░░ 42% ($0.0234) | main (3 files +45 -12) | my-project | Claude Opus 4
- ⟳ Fix auth bug (2/5) |  ✓ brainstorming |  ✓ Explore (3s) |  ✓ Glob ✓ Read ⟳ Edit
+██████░░░░░░░░░ 42% $0.23 ⏱ 4h11m (11%) · 6d5h (60%) | main (3 files +45 -12) | my-project | Opus 4.8 · xhigh
+ ⟳ Fix auth bug (2/5) |  ✓ brainstorming |  ✓ Explore (4t) |  ✓ Glob ✓ Read ⟳ Edit
 ```
 
-**Line 1** (Bash): Context bar, cost, git status, directory, model
+**Line 1** (Bash): Context bar, cost, rate limits, git status, directory, model + effort
 **Line 2** (Rust): Todos, skills, agents, tools
 
 ## Requirements
 
-- **macOS** (Apple Silicon)
+- **macOS** (Apple Silicon) or **Linux**
 - **Rust** (for building the binary)
 - **jq** (for JSON parsing)
+- **git** (for branch and working-tree diff stats)
 - **Claude Code** CLI
 
 ## Installation
@@ -36,7 +39,7 @@ A real-time statusline plugin for [Claude Code](https://claude.ai/claude-code) t
 ### Quick Install
 
 ```bash
-git clone https://github.com/moon1ite/claude-statusline.git
+git clone https://github.com/Liangtaiwan/claude-statusline.git
 cd claude-statusline
 ./install.sh
 ```
@@ -92,7 +95,8 @@ The plugin uses the [Catppuccin Mocha](https://github.com/catppuccin/catppuccin)
 | Section icons (, , ) | Lavender | `#b4befe` |
 | Complete (✓) | Green | `#a6e3a1` |
 | Running (⟳) | Yellow | `#f9e2af` |
-| Error (✗) | Red | `#f38ba8` |
+| Elevated: high/xhigh effort, 75–89% usage | Peach | `#fab387` |
+| Error, max effort, or ≥90% usage (✗) | Red | `#f38ba8` |
 | Separators | Gray | Standard terminal gray |
 
 ### Nerd Fonts
@@ -114,7 +118,7 @@ This plugin uses [Nerd Font](https://www.nerdfonts.com/) icons. Make sure your t
 ```
 claude-statusline/         # (your cloned repo)
 ├── statusline.sh          # Bash orchestrator (referenced by settings.json)
-│   ├── Line 1: Context, cost, git, directory, model (via jq)
+│   ├── Line 1: Context, cost, rate limits, git, directory, model + effort (via jq)
 │   └── Line 2: Calls claude-status binary
 ├── src/main.rs            # Rust source code
 ├── install.sh             # Installer script
@@ -128,7 +132,7 @@ claude-statusline/         # (your cloned repo)
 
 ### How It Works
 
-1. **Claude Code** calls `statusline.sh` periodically, passing JSON via stdin with model info, cost, and context window data.
+1. **Claude Code** calls `statusline.sh` periodically, passing JSON via stdin with model info, cost, context window, rate limits, and reasoning effort.
 
 2. **statusline.sh** (Bash):
    - Parses stdin JSON for Line 1 data
@@ -138,8 +142,9 @@ claude-statusline/         # (your cloned repo)
 3. **claude-status** (Rust):
    - Parses the JSONL transcript file
    - Tracks tool_use/tool_result pairs
-   - Tracks Task (agent) invocations
-   - Tracks TodoWrite updates
+   - Tracks Agent (subagent) invocations
+   - Tracks Skill invocations
+   - Tracks TaskCreate/TaskUpdate (todos)
    - Outputs formatted Line 2
 
 ### Transcript Parsing
@@ -150,11 +155,11 @@ The Rust binary implements event sourcing over the Claude Code transcript:
 |-------|--------|
 | `tool_use` | Add to running tools map |
 | `tool_result` | Move to completed, increment count |
-| `Task` tool_use | Create agent entry |
-| `Task` tool_result | Mark agent complete |
+| `Agent` tool_use | Create agent entry |
+| `Agent` tool_result | Mark agent complete, record tool count |
 | `Skill` tool_use | Create/update skill entry (deduplicated by name) |
 | `Skill` tool_result | Mark skill complete |
-| `TodoWrite` | Update todo state |
+| `TaskCreate` / `TaskUpdate` | Add / update todo state |
 | `user` message (top-level) | Mark pending reset |
 | `assistant` message (top-level) | Reset tools/agents for new turn |
 
