@@ -5,7 +5,7 @@ input=$(cat)
 
 # Extract all fields from JSON in a single jq call (pipe delimiter avoids empty-field collapse)
 IFS='|' read -r model_name current_dir transcript_path session_id session_cost context_percent \
-  effort_level fh_pct fh_reset sd_pct sd_reset lines_added lines_removed \
+  effort_level fh_pct fh_reset sd_pct sd_reset \
   <<< "$(echo "$input" | jq -r '[
     .model.display_name,
     .workspace.current_dir,
@@ -17,9 +17,7 @@ IFS='|' read -r model_name current_dir transcript_path session_id session_cost c
     ((.rate_limits.five_hour.used_percentage // 0) | floor | tostring),
     ((.rate_limits.five_hour.resets_at // "") | tostring),
     ((.rate_limits.seven_day.used_percentage // 0) | floor | tostring),
-    ((.rate_limits.seven_day.resets_at // "") | tostring),
-    ((.cost.total_lines_added // 0) | tostring),
-    ((.cost.total_lines_removed // 0) | tostring)
+    ((.rate_limits.seven_day.resets_at // "") | tostring)
   ] | join("|")')"
 
 # Colors
@@ -44,21 +42,24 @@ pct_color() {
     fi
 }
 
+# Format a countdown to an epoch target: "0h2m", or "6d5h" once >= 1 day.
+fmt_countdown() {
+    local target="$1"
+    [ -n "$target" ] && [ "$target" -gt "$now_sec" ] 2>/dev/null || return
+    local rem=$(( target - now_sec ))
+    local d=$(( rem / 86400 )) h=$(( (rem % 86400) / 3600 )) m=$(( (rem % 3600) / 60 ))
+    if [ "$d" -gt 0 ]; then printf '%dd%dh' "$d" "$h"; else printf '%dh%dm' "$h" "$m"; fi
+}
+
 # --- Rate limits (native, from payload rate_limits.{five_hour,seven_day}) -----
-# Claude Code provides utilization + reset epoch directly; no OAuth API, keychain,
-# curl, caching, or transcript-grep fallback needed anymore.
+# Show reset countdown + utilization for each window: "⏱ 0h2m (11%) · 20h3m (60%)"
 rate_info=""
 if [ -n "$fh_reset" ] || [ -n "$sd_reset" ]; then
-    reset_str=""
-    if [ -n "$fh_reset" ] && [ "$fh_reset" -gt "$now_sec" ] 2>/dev/null; then
-        remaining=$(( fh_reset - now_sec ))
-        rh=$(( remaining / 3600 ))
-        rm=$(( (remaining % 3600) / 60 ))
-        reset_str="${GRAY}⏱ ${rh}h${rm}m${NC} "
-    fi
+    fh_cd=$(fmt_countdown "$fh_reset")
+    sd_cd=$(fmt_countdown "$sd_reset")
     fh_c=$(pct_color "$fh_pct")
     sd_c=$(pct_color "$sd_pct")
-    rate_info=" ${reset_str}${fh_c}5h ${fh_pct}%${NC} ${GRAY}·${NC} ${sd_c}7d ${sd_pct}%${NC}"
+    rate_info=" ${GRAY}⏱${NC} ${fh_c}${fh_cd:+$fh_cd }(${fh_pct}%)${NC} ${GRAY}·${NC} ${sd_c}${sd_cd:+$sd_cd }(${sd_pct}%)${NC}"
 fi
 
 # Build context progress bar (15 chars wide)
@@ -70,25 +71,27 @@ empty=$((bar_width - filled))
 bar="${full:0:filled}${empty_str:0:empty}"
 context_info="${GRAY}${bar}${NC} ${context_percent}%"
 
-# Session cost
+# Session cost: $3.48
 cost_info=""
 if [ -n "$session_cost" ] && [ "$session_cost" != "null" ] && [ "$session_cost" != "empty" ]; then
     session_cost=$(printf "%.2f" "$session_cost")
     cost_info=" ${GRAY}\$${session_cost}${NC}"
 fi
 
-# Lines changed this session (cost.total_lines_added / total_lines_removed)
-lines_info=""
-if [ "${lines_added:-0}" -gt 0 ] 2>/dev/null || [ "${lines_removed:-0}" -gt 0 ] 2>/dev/null; then
-    lines_info=" ${GREEN}+${lines_added}${NC} ${RED}-${lines_removed}${NC}"
-fi
-
-# Directory name and git branch (falls back to short SHA when detached)
+# Directory name and git branch + working-tree diff stats: main (3 files +45 -12)
 dir_name="${current_dir##*/}"
 branch=$(git -C "$current_dir" symbolic-ref --short -q HEAD 2>/dev/null \
          || git -C "$current_dir" rev-parse --short HEAD 2>/dev/null)
 if [ -n "$branch" ]; then
     git_info=" ${YELLOW}${branch}${NC}"
+    stats=$(git -C "$current_dir" diff HEAD --numstat 2>/dev/null)
+    if [ -n "$stats" ]; then
+        n_files=$(printf '%s\n' "$stats" | grep -c '^')
+        n_add=$(printf '%s\n' "$stats" | awk '{a+=$1} END{print a+0}')
+        n_del=$(printf '%s\n' "$stats" | awk '{d+=$2} END{print d+0}')
+        file_word="files"; [ "$n_files" -eq 1 ] && file_word="file"
+        git_info="${git_info} ${GRAY}(${n_files} ${file_word} ${GREEN}+${n_add} ${RED}-${n_del}${GRAY})${NC}"
+    fi
 else
     git_info=""
 fi
@@ -104,8 +107,8 @@ if [ -n "$effort_level" ]; then
     model_info="${model_info} ${GRAY}·${NC} ${eff_c}${effort_level}${NC}"
 fi
 
-# Line 1: context, cost, lines, rate limits, git, dir, model + effort
-line1="${context_info}${cost_info}${lines_info}${rate_info}${git_info:+ ${GRAY}|${NC}}${git_info} ${GRAY}|${NC} ${BLUE}${dir_name}${NC} ${GRAY}|${NC} ${model_info}"
+# Line 1: context, cost, rate limits, git (branch + stats), dir, model + effort
+line1="${context_info}${cost_info}${rate_info}${git_info:+ ${GRAY}|${NC}}${git_info} ${GRAY}|${NC} ${BLUE}${dir_name}${NC} ${GRAY}|${NC} ${model_info}"
 
 # Line 2: tool/agent/todo status from the Rust binary (transcript parsing)
 line2=""
