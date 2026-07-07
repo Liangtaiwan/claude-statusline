@@ -78,22 +78,24 @@ if [ -n "$session_cost" ] && [ "$session_cost" != "null" ] && [ "$session_cost" 
     cost_info=" ${GRAY}\$${session_cost}${NC}"
 fi
 
-# Directory name and git branch + working-tree diff stats: main (3 files +45 -12)
+# Directory name
 dir_name="${current_dir##*/}"
+dir_seg="${BLUE}${dir_name}${NC}"
+
+# Git branch + working-tree diff stats: chezmoi (3 files +45 -12)
 branch=$(git -C "$current_dir" symbolic-ref --short -q HEAD 2>/dev/null \
          || git -C "$current_dir" rev-parse --short HEAD 2>/dev/null)
+git_seg=""
 if [ -n "$branch" ]; then
-    git_info=" ${YELLOW}${branch}${NC}"
+    git_seg="${YELLOW}${branch}${NC}"
     stats=$(git -C "$current_dir" diff HEAD --numstat 2>/dev/null)
     if [ -n "$stats" ]; then
         n_files=$(printf '%s\n' "$stats" | grep -c '^')
         n_add=$(printf '%s\n' "$stats" | awk '{a+=$1} END{print a+0}')
         n_del=$(printf '%s\n' "$stats" | awk '{d+=$2} END{print d+0}')
         file_word="files"; [ "$n_files" -eq 1 ] && file_word="file"
-        git_info="${git_info} ${GRAY}(${n_files} ${file_word} ${GREEN}+${n_add} ${RED}-${n_del}${GRAY})${NC}"
+        git_seg="${git_seg} ${GRAY}(${n_files} ${file_word} ${GREEN}+${n_add} ${RED}-${n_del}${GRAY})${NC}"
     fi
-else
-    git_info=""
 fi
 
 # Model + effort (effort.level is the current session's reasoning setting)
@@ -107,8 +109,9 @@ if [ -n "$effort_level" ]; then
     model_info="${model_info} ${GRAY}·${NC} ${eff_c}${effort_level}${NC}"
 fi
 
-# Line 1: context, cost, rate limits, git (branch + stats), dir, model + effort
-line1="${context_info}${cost_info}${rate_info}${git_info:+ ${GRAY}|${NC}}${git_info} ${GRAY}|${NC} ${BLUE}${dir_name}${NC} ${GRAY}|${NC} ${model_info}"
+# Line 1: context, cost, rate limits, dir, git (branch + stats), model + effort
+sep=" ${GRAY}|${NC} "
+line1="${context_info}${cost_info}${rate_info}${sep}${dir_seg}${git_seg:+${sep}${git_seg}}${sep}${model_info}"
 
 # Line 2: tool/agent/todo status from the Rust binary (transcript parsing)
 line2=""
